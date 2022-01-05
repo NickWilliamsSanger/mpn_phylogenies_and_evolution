@@ -1,0 +1,432 @@
+---
+author: "Nick Williams"
+output: html_document
+---
+
+```{r setup, echo=TRUE,message=FALSE,warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("kableExtra")
+library("phytools")
+library("GGally")
+library("data.table")
+library("lme4")
+library("lubridate")
+library("phylolm")
+library("dplyr")
+library("ggplot2")
+library("tidyr")
+library("MCMCglmm")
+library("metafor")
+options(dplyr.summarise.inform = FALSE)
+VERBOSE=FALSE
+NITT = 1100000
+BURNIN = 100000 
+THIN = 1000
+if(FALSE){
+  ##For testing 
+  NITT=NITT/10
+  BURNIN=BURNIN/10
+  THIN=THIN/2
+}
+PATIENTS=c("PD7271","PD5182","PD5163", "PD5847","PD5179","PD6634", "PD9478",  "PD6629","PD6646", "PD5117", "PD4781","PD5147" )
+set.seed(1234567)
+```
+---
+title: "Telomere Analysis of MPN Colonies"
+
+date: `r format(Sys.Date(), "%d/%m/%Y")`
+---
+## Load Processed Data
+Load the pre-processed patient data into a list, PDD, each with structures pertaining to a single patient.
+```{r include=FALSE}
+if(FALSE){
+  #to load the data from scratch:
+  PDD=get_PDD()
+  PDD=lapply(PDD,function(PD){PD$pdx=add_node_to_cna(PD$pdx);PD})
+  PDD=lapply(PDD,add_adjustment_models)
+  PDD=lapply(PDD,wraptreefit,niter=20000,b.fit.null = FALSE,method="poisson_tree")
+  PDD=lapply(PDD,wraptreefit,niter=20000,b.fit.null = TRUE,method="poisson_tree")
+  ##Cutdown the data required for this analysis
+  dummy=rtree(4)
+  PDD=lapply(PDD,function(PD) {
+    list(patient=PD$patient,
+         ultratree=PD$fit$poisson_tree$nullmodel$ultratree[names(dummy)] %>% 
+           (function(x) {class(x)="phylo";x}),
+         agedf=PD$pdx$agedf %>% dplyr::select(patient,tip.label,age_at_sample_pcy,telo_mean_length,driver2,driver3))
+    }
+    )
+}
+```
+
+```{r loaddata}
+
+## The following is a list of per patient lists where each patient list has the following structure:
+#   patient : name of patient  
+#   agedf :  summary info per colony (e.g. telomere length)
+#   ultratree : ultrametric tree (ultratree) per patient. 
+PDD=readRDS("../data/PDD_TELO.RDS")
+str(PDD$PD5182)
+```
+## Extract Cohort Dataframe and Sharedness Metric
+```{r}
+## Define some utility tree functions
+get_all_node_children=function(node,tree){
+  children=tree$edge[which(tree$edge[,1]==node),2]
+  offspring=children
+  for(child in children){
+    offspring=c(offspring,get_all_node_children(child,tree))
+  }
+  offspring
+}
+get_samples_in_clade=function(node,tree){
+  if(node<=length(tree$tip.label)){
+    return(tree$tip.label[node])
+  }
+  tree$tip.label[intersect(get_all_node_children(node,tree),1:length(tree$tip.label))]
+}
+## Defines a sharing metric representing the average ACF of mutations carried by each single cell derived colony
+get_smetric=function(tree){
+  n=sapply(tree$edge[,2],function(x) length(get_samples_in_clade(x,tree)))/length(tree$tip.label)
+  t2=tree
+  t2$edge.length=t2$edge.length*n
+  idx=match(1:length(t2$tip.label),t2$edge[,2])
+  nodeHeights(t2)[idx,2]/nodeHeights(tree)[idx,2]
+}
+
+df=do.call("rbind",lapply(PDD,function(PD){
+  tree=drop.tip(PD$ultratree,"zeros")
+  pshare=get_smetric(tree)
+  PD$agedf %>% filter(tip.label!="zeros") %>% left_join(data.frame(tip.label=tree$tip.label,pshare=pshare,stringsAsFactors=FALSE))
+}))
+df$logpshare=log(df$pshare)
+```
+
+## Summary Telomere plots
+
+```{r telomereplot,dev.args=list(pointsize=8),fig.height=6,fig.width=8}
+get_drivergroup_colors=function(alpha=0.8){
+  MUSTARD="#ffdb58"
+  data.frame(colour=sapply(c("red3",MUSTARD,"grey"),function(x) adjustcolor(x,alpha=alpha)),
+             driver2=c("JAK2","Other","WT"),
+             desc=c("JAK2","Other Drivers","Wild Type"),
+             stringsAsFactors = FALSE)
+}
+getcolor_df=function(mut_count){
+  col.df=data.frame(patient=unique(as.character(mut_count$patient)),stringsAsFactors = FALSE)
+  col.df$col=ggplot_color(dim(col.df)[1])
+  col.df
+}
+ggplot_color=function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+coldf=get_drivergroup_colors(alpha=1)
+cdf=getcolor_df(data.frame(patient=PATIENTS ))
+patientColorScale=cdf$col
+names(patientColorScale)=factor(cdf$patient,ordered = TRUE)
+patientColorScale=scale_color_manual(name="Patient",values=patientColorScale)
+  yylab="Mean Telomere Length(bp)"
+  aggdf=df %>% group_by(patient,age_at_sample_pcy,driver2) %>%
+    summarise(telo_mean_length=mean(telo_mean_length),n=length(driver2))
+  plt=ggplot(data=df, aes(x=age_at_sample_pcy, y=telo_mean_length))+
+    geom_jitter(aes(x=age_at_sample_pcy,y=telo_mean_length,col=driver2),width=0.3,height=0,size=1)+
+    geom_point(data=aggdf,aes(col=driver2),size=4)+
+    geom_point(data=aggdf,shape = 1,size = 4,colour="black")+
+    theme_bw() +xlab("Age @ Sample")+ylab(yylab)+xlim(c(0,100))+ylim(c(0,8000))+
+    ggtitle(sprintf("%s vs Driver Status and Age @ Sample",yylab))+
+    theme(legend.text = element_text(size=12),legend.position=c(1,1),
+          legend.justification = c(1,1),
+          legend.background=element_rect(linetype = 1, size = 0.5, colour = 1),
+          panel.background = element_rect(linetype = 1, size = 0.5, colour = 1))+
+    scale_color_manual(name=NULL,breaks=coldf$driver2,labels = coldf$desc, values = coldf$colour)+
+    guides(colour = guide_legend(override.aes = list(size=2)))
+print(plt)
+```
+
+The following shows the telomere lengths explicitly grouped by patient and timepoint:
+
+```{r telomeres1,dev.args=list(pointsize=8),fig.height=10,fig.width=10}
+age_labeller=as_labeller(function(x) sprintf("Age @ Sample=%3.1f",as.numeric(x)))
+ggplot(data=df,aes(x=driver2,y=telo_mean_length,colour=driver2))+
+  geom_boxplot()+ geom_jitter(shape=16,position=position_jitter(0.2))+xlab("Driver Status")+ylab("Mean Telomere Length(bp)")+
+  facet_wrap(~patient+age_at_sample_pcy,labeller=labeller(age_at_sample_pcy=age_labeller))+scale_color_manual(name=NULL,breaks=coldf$driver2,labels = coldf$desc, values = coldf$colour)+theme_bw()+ggtitle("Telomere Lengths vs Driver Status:Within Timepoint")
+```
+
+Notice that not all timepoints have representatives of both JAK2 and WT, here we discard those timepoints and where there are multiple timepoints (just PD5182 after the preceding exclusions) we average JAK2 and WT telomere lengths across timepoints (equally weighted)  and note that JAK2 telomere length is significantly less using the non-parametric Wilcoxon signed rank test. Note that a two-sided binomial test on the probability of observing JAK2>WT for all 10 cases gives the same p-value. 
+
+```{r}
+agg1=aggdf %>% pivot_wider(names_from=driver2,values_from=c("telo_mean_length","n"))
+colnames(agg1)=gsub(pattern = "telo_mean_length_",replacement = "",colnames(agg1))
+kable(agg1, "html") %>% kable_styling("striped")
+```
+
+```{r}
+agg2=agg1 %>% filter(!is.na(JAK2) & !is.na(WT)) %>% group_by(patient) %>% summarise(JAK2=mean(JAK2),
+                                        WT=mean(WT),
+                                        age_mean=mean(age_at_sample_pcy)
+                                        ) %>% mutate(
+                                          telo_JAK2_delta=JAK2-WT
+                                        ) %>% (function(df) df[order(df$age_mean),])
+ggplot(data=agg2 %>% mutate(patient=factor(patient,levels=PATIENTS,ordered=TRUE)),aes(x=age_mean,y=telo_JAK2_delta,colour=patient))+geom_point(shape=15,size=3)+patientColorScale+ggtitle("JAK2-WT Telomere Length vs Age")+theme_bw()+
+  xlab("Mean Age(Years)")+ylab("JAK2-WT Telomere Length (bp)")+ylim(c(-1500,0))+xlim(c(20,90))
+kable(agg2, "html") %>% kable_styling("striped")
+
+print(wilcox.test(agg2$JAK2-agg2$WT))
+```
+
+The mean difference between JAK2 and WT is `r mean(agg2$JAK2-agg2$WT)` .  We will see that we obtain a similar result when performing more sophisticated analyses that attempt to account for the degree of shared history between colonies.
+
+## Formal Assessment of Heritability of Telomere Length and Mutation Burden
+Under a model of stochastic drift with negative trend the telomere lengths of more closely related colonies will tend to be more similar than those of more distantly related colonies. We formally assess the heritability of telomere length using two well established metrics, Pagel's Lambda and Blomberg's K, that essentially measure whether the observed covariance in a trait is in line with the expected covariance based on the phylogenetic relationship (both measures are expected to equal 1 if the trait exhibits the expected covariance).  We assess significance using phytool's phylosig function.
+
+The following utility function subsets the specified patient data to the timepoint with the largest number of informative colonies
+```{r}
+get_treedat=function(PD,drop="Other",b.all=FALSE){
+  if(b.all){
+    ##Just drop the outgroup (ignores drop param). Not timepoint restriction
+    phy=drop.tip(PD$ultratree,"zeros")
+    dat=data.frame(tip.label=phy$tip.label) %>% left_join(PD$agedf,by="tip.label")
+    return(list(dat=dat,phy=phy))
+  }
+  patient=PD$patient
+  ddf=PD$agedf
+  if(drop=="Other"){
+    #Drops non-JAK2 driver clades and restrict to single timepoint
+    drop.extra=ddf$tip.label[which(ddf$driver2=="Other")]
+    maxc=PD$agedf %>% filter(driver2=="JAK2") %>% group_by(age_at_sample_pcy) %>% summarise(count=length(tip.label)) %>% filter(count==max(count))
+  }else if(drop=="Drivers"){
+    drop.extra=ddf$tip.label[which(ddf$driver2!="WT")]
+    maxc=PD$agedf %>% filter(driver2=="WT") %>% group_by(age_at_sample_pcy) %>% summarise(count=length(tip.label)) %>% filter(count==max(count))
+  }else if(drop=="None"){
+    #Doesn't aim to drop colonies but restricts to timepoint with most colonies.
+    drop.extra=c()
+    maxc=PD$agedf %>% group_by(age_at_sample_pcy) %>% summarise(count=length(tip.label)) %>% filter(count==max(count))
+  }else{
+    stop("invalid drop param supplied (Other|Drivers|None)")
+  }
+  tips=PD$agedf$tip.label[which(PD$agedf$age_at_sample_pcy==maxc$age_at_sample_pcy)]
+  tree=drop.tip(PD$ultratree,setdiff(PD$ultratree$tip.label,setdiff(tips,drop.extra)))
+  dat=data.frame(tip.label=tree$tip.label)
+  
+  dat=dat %>% left_join(ddf,by="tip.label")
+  rownames(dat)=dat$tip.label
+  list(dat=dat,phy=tree)
+}
+```
+
+### Telomere Length is Heritable for all patient trees
+The lambda values are all in the vicinity of 1 or above and are significantly non-zero for all patients except for PD5147 where power is limited because there is little difference in sharedness in the mutant colonies.
+```{r}
+zlambda=lapply(PDD,function(PD){
+  tmp=get_treedat(PD,b.all = TRUE)
+  phylosig(tmp$phy,tmp$dat$telo_mean_length %>% (function(x){names(x)=tmp$dat$tip.label;x}),test=TRUE,method = "lambda")}
+  )
+zk=lapply(PDD,function(PD){
+  tmp=get_treedat(PD,b.all = TRUE)
+  phylosig(tmp$phy,tmp$dat$telo_mean_length %>% (function(x){names(x)=tmp$dat$tip.label;x}),test=TRUE,method = "K")}
+  )
+
+psigres=data.frame(patient=sapply(PDD,function(PD) PD$patient),
+                   lambda=sapply(zlambda,function(x) x$lambda),
+                   lambda_pval=sapply(zlambda,function(x) x$P),
+                   K=sapply(zk,function(x) x$K),
+                   K_pval=sapply(zk,function(x) x$P))
+kable(psigres,"html") %>% kable_styling("striped")
+```
+
+
+## Assessing Telomere Length vs Sharedness and Driver Status
+
+We define a metric, pshare , that captures the degree of shared history as a weighted average of the proportion of sampled clones that share each mutation (see [Extract Cohort Dataframe and Sharedness Metric]). Alternatively it can be viewed as the average aberrant cell fraction of the mutations carried by the colony.   
+
+The following shows that there is a strong relationship between driver status and $pshare$, when stratified by patient and age @ sample
+
+```{r teloshare2,dev.args=list(pointsize=8),fig.height=10,fig.width=10}
+ggplot(data=df,aes(x=driver2,y=pshare,colour=driver2))+geom_boxplot()+ geom_jitter(shape=16, position=position_jitter(0.2))+facet_wrap(~patient+age_at_sample_pcy,labeller=labeller(age_at_sample_pcy=age_labeller))+scale_color_manual(name=NULL,breaks=coldf$driver2,labels = coldf$desc, values = coldf$colour)+theme_bw()+ggtitle("Sharedness vs Driver Status : Within Timepoint")
+```
+
+Visually we can see a consistent pattern that telomere length declines with Sharedness:
+```{r smetric,dev.args=list(pointsize=8),fig.height=10,fig.width=10}
+ggplot(data=df,aes(x=log(pshare),y=telo_mean_length,col=patient,shape=driver2))+
+geom_point(size=2)+
+geom_smooth(inherit.aes=FALSE,aes(x=log(pshare),y=telo_mean_length,col=patient),method=lm,formula=y~x,se=FALSE)+
+patientColorScale+
+scale_shape_manual(name="Driver Status",label=c("WT"="WT","Other"="Other Drivers","JAK2"="JAK2"),values=c(0,1,2))+
+facet_wrap(~patient+age_at_sample_pcy,
+labeller=labeller(age_at_sample_pcy=age_labeller))+
+ggtitle("Telomere Length vs Log(Sharedness) Stratified by Patient and Age")+
+labs(x="Log(Sharedness)",y="Telomere Length(kb)")+theme_bw()
+```
+
+## Phylogeny aware mixed model telomere analysis
+
+Here we setup the covariance for a phylogeny aware mixed model where the patient intercepts are random effects.  The pan-cohort covariance is essentially derived from a direct sum of per patient covariance matrices based on the tree shared branch lengths. This general approach has been previously used in  "Convergent somatic mutations in effectors of insulin signalling in chronic liver disease" by S. Ng et al.
+
+```{r telomeres, message=FALSE, warning=FALSE}
+
+JAK2_PATIENTS=setdiff(PATIENTS,c("PD6634","PD5147"))
+PDD=PDD[JAK2_PATIENTS]
+df=df %>% filter(patient %in% JAK2_PATIENTS)
+df$colony=df$tip.label
+df$combo_id=sprintf("%s_%s",df$patient,df$colony)
+others=df$combo_id[df$driver2=="Other"]
+get_inverseA=function(PD){
+  othertips=PD$agedf$tip.label[which(sprintf("%s_%s",PD$patient,PD$agedf$tip.label) %in% others)]
+  tt=multi2di(drop.tip(PD$ultratree,c("zeros",othertips)))
+  tt$edge.length=ifelse(tt$edge.length<1e-3,1e-3,tt$edge.length)
+  inva=inverseA(tt,scale=FALSE)$Ainv
+  row.names(inva)=sprintf("%s_%s",PD$patient,row.names(inva))
+  list(inva=inva,colony=tt$tip.label,patient=PD$patient,key=sprintf("%s_%s",PD$patient,tt$tip.label))
+}
+inv.list=lapply(PDD,get_inverseA)
+keys=do.call("c",lapply(inv.list,function(x) x$key))
+inverseA=bdiag(lapply(inv.list,function(x) x$inva))
+row.names(inverseA)=do.call("c",lapply(inv.list,function(x) row.names(x$inva)))
+df2=df[match(keys,df$combo_id),]
+```
+
+### Fit the model based on Driver Status
+
+The following is our central result for comparing the telomere length of wild-type and JAK2 colonies
+
+```{r}
+model <- MCMCglmm(telo_mean_length ~ driver2 + age_at_sample_pcy,
+random = ~ combo_id + patient,
+ginverse=list(combo_id = inverseA), family="gaussian",data=df2, verbose=FALSE, nitt = NITT, burnin = BURNIN, thin = THIN)
+print(summary(model))
+```
+
+### Fit the model based on sharedness alone
+
+```{r}
+smodel <- MCMCglmm(telo_mean_length ~ logpshare+age_at_sample_pcy,
+random = ~ combo_id + patient,
+ginverse=list(combo_id = inverseA), family="gaussian",data=df2, verbose=FALSE,nitt = NITT, burnin = BURNIN, thin = THIN)
+print(summary(smodel))
+```
+
+Note that we are unable to fit a model that includes both "driver2" and "pshare" because they are approximately co-linear.
+
+### Aberrant cell fraction as a proxy for number of additional symmetric divisions
+
+When a single cell acquires the driver it initially represents a very small proportion of the HSC population $\text{Initial aberrant cell fraction}=\frac{1}{N_{\text{HSC}}}$. Every additional symmetric division in the mutant population average relative to wild type cell population average increases the mutant population by a factor of 2 and so
+
+\[\text{Final aberrant cell fraction}= \frac{2^{N_{extra}}}{N_{\text{HSC}}}\]
+
+and therefore
+
+\[\text{Number additional divisions} \sim log2(N_{\text{HSC}} \times \text{aberrant cell fraction})\]
+
+The following analysis is only weakly dependent on the asssumed $N_{\text{HSC}}$ which we set to 100,000.
+
+We examine JAK2 patients with more than 2 wild-type colonies and also exclude PD6646 since is this case the wild-type colonies have themselves undergone a clonal expansion:
+
+```{r}
+JAK2_PATIENTS=setdiff(JAK2_PATIENTS,c("PD6646","PD6629","PD4781"))
+add_num_additional_divisions=function(dat,nhsc=1e5){
+  #Check we just have JAK2 and WILDTYPE
+  if(length(which(dat$driver2 %in% c("JAK2","WT")))!=length(dat$driver2)){
+    stop("Analysis only supports JAK2 vs WT")
+  }
+  njak=length(which(dat$driver2=="JAK2"))
+  ntot=length(dat$driver2)
+  dat$jak2=ifelse(dat$driver2=="JAK2",1,0)
+  #log2 measures the number of additional divisions since aquisition of JAK2
+  dat$num_additional_divisions=ifelse(dat$driver2=="JAK2",  
+                  log2(nhsc*njak/ntot), ## For cells carrying JAK2
+                  0 ## Wild-Type cells have undergone no extra divisions
+                  )
+  dat
+}
+
+allres=lapply(PDD[JAK2_PATIENTS],function(PD) {
+  tmp=get_treedat(PD)
+  tmp$dat=add_num_additional_divisions(tmp$dat,nhsc=1e5)
+  fit=phylolm(telo_mean_length~num_additional_divisions,data=tmp$dat,phy=tmp$phy,model="BM",measurement_error = TRUE)
+  fit}
+)
+res=sapply(allres,function(x) c(beta=x$coefficients[2],se=sqrt(x$vcov[4])))
+ranm=rma(res["beta.num_additional_divisions",],sei=res["se",])
+print(summary(ranm))
+forest(ranm,slab=colnames(res))
+title("Random Effect Meta-Analysis: Telomere length vs\n Estimated Number of Additional Divisions")
+```
+
+We get a similar picture if we use JAK2 status.   
+
+```{r}
+allres=lapply(PDD[JAK2_PATIENTS],function(PD) {
+  tmp=get_treedat(PD)
+  tmp$dat=add_num_additional_divisions(tmp$dat,nhsc=1e5)
+  fit=phylolm(telo_mean_length~jak2,data=tmp$dat,phy=tmp$phy,model="BM",measurement_error = TRUE)
+  fit}
+)
+res=sapply(allres,function(x) c(beta=x$coefficients[2],se=sqrt(x$vcov[4])))
+ranm=rma(res["beta.jak2",],sei=res["se",])
+print(summary(ranm))
+forest(ranm,slab=colnames(res))
+title("Random Effect Meta-Analysis: Telomere length vs\n JAK2")
+```
+
+
+
+### Plots of Telomere Length and Burden vs Estimated Number Additional Divisions
+
+Firstly, we re-collate the data and add our crude estimate for the number of additional divisions.  
+
+```{r}
+df=do.call("rbind",lapply(PDD[JAK2_PATIENTS],function(PD) {
+  tmp=get_treedat(PD)
+  tmp$dat=add_num_additional_divisions(tmp$dat,nhsc=1e5)
+  tmp$dat}
+))
+```
+
+Assess telomere length vs estimated number of divisions. Also note how little variability there is in this number of divisions - this is a reflection of the likelihood that once a driver is detectable it has already undertaken most of it's additional divisions compared to wild-type.
+
+```{r, dev.args=list(pointsize=8),fig.height=10,fig.width=10}
+ggplot(data=df,aes(x=num_additional_divisions,y=telo_mean_length,col=patient,shape=driver2))+
+geom_point(size=2)+
+geom_smooth(inherit.aes=FALSE,aes(x=num_additional_divisions,y=telo_mean_length,col=patient),method=lm,formula=y~x)+
+patientColorScale+scale_shape_manual(name="Driver Status",label=c("WT"="WT","Other"="Other Drivers","JAK2"="JAK2"),values=c(0,1,2))+
+facet_wrap(~patient+age_at_sample_pcy,
+labeller=labeller(age_at_sample_pcy=age_labeller))+
+ggtitle("Telomere Length vs Estimated Number Drivers (log2(ACF*nhsc)) Stratified by Patient and Age")+
+labs(x="log2(ACF*nhsc)",y="Telomere Length(kb)")+theme_bw()
+```
+
+
+
+### Mixed Model of Telomere Length vs Estimated Number Additional Division
+
+Setup the mixed-model again:
+
+```{r}
+df$colony=df$tip.label
+df$combo_id=sprintf("%s_%s",df$patient,df$colony)
+get_inverseA=function(PD){
+  othertips=PD$ultratree$tip.label[which(!(sprintf("%s_%s",PD$patient,PD$ultratree$tip.label) %in% df$combo_id))]
+  tt=multi2di(drop.tip(PD$ultratree,c("zeros",othertips)))
+  tt$edge.length=ifelse(tt$edge.length<1e-3,1e-3,tt$edge.length)
+  inva=inverseA(tt,scale=FALSE)$Ainv
+  row.names(inva)=sprintf("%s_%s",PD$patient,row.names(inva))
+  list(inva=inva,colony=tt$tip.label,patient=PD$patient,key=sprintf("%s_%s",PD$patient,tt$tip.label))
+}
+inv.list=lapply(PDD[JAK2_PATIENTS],get_inverseA)
+keys=do.call("c",lapply(inv.list,function(x) x$key))
+inverseA=bdiag(lapply(inv.list,function(x) x$inva))
+row.names(inverseA)=do.call("c",lapply(inv.list,function(x) row.names(x$inva)))
+df2=df[match(keys,df$combo_id),]
+```
+
+## Telomere Length vs Number of Estimated Divisions
+
+```{r}
+#NITT = 1100000
+#BURNIN = 100000 
+#THIN = 1000
+model <- MCMCglmm(telo_mean_length ~ num_additional_divisions + age_at_sample_pcy,
+random = ~  patient ,
+ginverse=list(combo_id = inverseA), family="gaussian",data=df2, verbose=FALSE, nitt = NITT, burnin = BURNIN, thin = THIN)
+print(summary(model))
+```

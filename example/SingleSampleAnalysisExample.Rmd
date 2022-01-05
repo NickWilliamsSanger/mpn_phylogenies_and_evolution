@@ -1,0 +1,301 @@
+---
+author: "Nick Williams"
+output: html_document
+params:
+      PDID: "PD6629"
+      TREEMODEL: "poisson_tree"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)#,dev = c('png', 'pdf'),fig.path=sprintf('figures/%s',PDID))
+PDID=params$PDID
+treemodel=params$TREEMODEL
+```
+
+---
+title: `r PDID`
+date: `r format(Sys.Date(), "%d/%m/%Y")`
+---
+
+## Load the data for a single patient 
+
+```{r, message=FALSE,error=FALSE,results=FALSE}
+source("code.R")
+source("cna.R")
+library("kableExtra")
+options(dplyr.summarise.inform = FALSE)
+PDID=params$PDID
+treemodel=params$TREEMODEL
+MUTCOUNTBIN="./MUTCOUNTBINS.RDS"
+bins=readRDS(MUTCOUNTBIN)
+PD=readRDS("PD6629.RDS")
+# Pathogenic substitution types
+CV=c("missense","nonsense","ess_splice","frameshift","inframe","cna","loh","start_lost","nc_ess_splice","stop_lost","complex_sub")
+##  Read in list of genes of interest (from other pubs or dnds - here taken from prognostics).
+GENES=readLines("GENES.txt")
+refcolony=PD$refcolony
+CENSOR_GERMLINE=TRUE
+```
+
+## The PD data structure:
+
+* localx.correction2 : This is the correction factor that should be applied to autosomal burden based on thelocal mutation rate weighted proportion of the copy number/LOH masked autosomal genome.
+* pdx : a data structure that contains the tree and information about the variants that have been carried through to tree construction
+	* df : An internal data structure. Ignore.
+	* tree_ml : Inferred tree as an APE phylo object.  This contains additional vectors in parallel to edge.length.
+	* summary : Per locus info on branch assignment. Parallel to pdx\$dat\$details etc..
+		* ml : Most likely branch - maps to edge index in tree_ml\$edge i.e. ml=5 corresponds to tree_ml\$edge[5,]
+		* pval : Heuristic p-value testing whether locus fits the tree at all.  
+		* p_else_where : Given the topology is correct then what is the probability the variant maps to a branch different to that specified by "ml" 
+		* profile :  A string representation of the genotype - implied by "ml"
+	* dat  :  A list of aligned dataframes and matrices,  
+		* details:  Dataframe with locus summary info
+		* mtr : Mutant read count matrix.  Column names correspond to short colony names.
+		* dep : Depth count matrix
+		* mtr_d : Filtered depth count matrix.
+		* geno_colony: Genotypes of tree colonies excluding "zeros" 
+		* gp : Probability genotype is mutant.
+		* ofs : Original caveman status 0=PASS Call by Caveman(or Pindel); 1=Not called or FAILED call by Caveman(or Pindel).
+  * cfg 	: Config info datafame. Essentially a copy of the original config file.
+    * LABEL:  Long name for sample. Unique across cohort
+    * SHORT_LABEL: Convenient short label for use as tree tip labels etc.  Not unique across cohort
+  * meta : a list containing various metadata
+    * LOH : List of LOH events including samples that share the event and the genomic region.
+    * CNA : List of CNA events including samples that share the event and the genomic region.
+    
+
+## `r PDID` Sample Summary
+
+```{r echo=FALSE}
+kable(PD$pdx$meta$sample_summary, "html") %>% kable_styling("striped")
+```
+
+## Tree
+```{r echo = t, dev.args=list(pointsize=8),fig.height=5,fig.width=10,message=FALSE,results=FALSE}
+tree=plot_basic_tree(PD$pdx,label = PD$patient,style="classic",cv=CV,genes=GENES)
+```
+
+## Expanded Tree with Node Labels
+
+The nodes in this plot can be cross-referenced with nodes specified in subsequent results.  The plot also serves to give an idea of what the topology at the top of the tree looks like.
+
+```{r echo = t, dev.args=list(pointsize=8),fig.height=5,fig.width=10,message=FALSE,results=FALSE}
+tree=plot_basic_tree(expand_short_branches(PD$pdx,prop = 0.1),label = PD$patient,style="classic",cv=CV,genes=GENES)
+node_labels(tree)
+```
+
+
+
+## Timing of driver mutations (using Model = `r treemodel` )  
+
+Note that the different colours on the tree indicate the separately fitted mutation rate clades.
+```{r  echo = TRUE, dev.args=list(pointsize=8),fig.height=5,fig.width=12,message=TRUE,error=TRUE,results=FALSE}
+##Run null and alt models
+NITER=2000
+##The following populates a list PD$fit$<treemodel>$<altmodel|nullmodel>.  The function wraptreefit wraps a call to the rtreefit package.
+PD=wraptreefit(PD,niter=NITER,b.fit.null = FALSE,method=treemodel)
+PD=wraptreefit(PD,niter=NITER,b.fit.null = TRUE,method=treemodel)
+par(mfcol=c(1,2))
+tree=plot_tree(PD$fit[[treemodel]]$nullmodel$ultratree,cex.label=0);title(sprintf("%s:Ultrametric tree with single rate fitted",PD$patient))
+tree=plot_tree(get_colored_markup_tree(PD$fit[[treemodel]]$altmodel$ultratree,PD$nodes$node[PD$nodes$status>=0]),cex.label=0);title(sprintf("%s:Ultrametric tree with multiple rates fitted",PD$patient))
+```
+
+
+
+
+## Driver Specific Mutation Rates & Telomere Lengths by Colony & Timepoint
+
+```{r echo=FALSE,dev.args=list(pointsize=8),fig.height=4,fig.width=10}
+ratesum=do_lambda_plot(get_stan_result_df(PD,model = treemodel,bIsNull = FALSE),list(PD))
+kable(ratesum %>% dplyr::rename(mean_lambda_rescaled=mean_rescaled) %>% dplyr::select(node,driver,status,child_count,type,	colony_count,mean_lambda_rescaled,	correction,	sd_rescaled,	lb_rescaled,	ub_rescaled,	median_rescaled,	p_lt_wt), "html") %>% kable_styling("striped") %>% scroll_box(width="95%")
+```
+
+## Driver Acquisition Timeline
+
+All ages are in terms of post conception years.  The vertical red lines denote when colonies were sampled and blue lines when targeted follow up samples were taken.
+
+```{r echo = FALSE, dev.args=list(pointsize=8),fig.height=3,fig.width=10,message=FALSE}
+globaltimings=collate_driver_info(list(PD),treemodel = treemodel,b.is.null = TRUE)
+tmp1=suppressWarnings(
+  do_acquisition_plot2b(inf=globaltimings,PD$pdx$meta$COLONY_TIMEPOINTS,PD$pdx$meta$RECAP_TIMEPOINTS,
+                       extra=": Global Rates",
+                       b.add.text = TRUE,
+                       xmax=ceiling(max(globaltimings$max_age_at_sample)/10)*10))
+fields=c("patient","node","driver",	"child_count","lower_median","upper_median","lower_lb95","lower_ub95","upper_lb95","upper_ub95","N","group","age_at_diagnosis_pcy",
+             "max_age_at_sample",	"min_age_at_sample")
+kable(globaltimings[,fields], "html") %>% kable_styling("striped") %>% scroll_box(width="95%")
+```
+
+```{r echo = FALSE, dev.args=list(pointsize=8),fig.height=3,fig.width=10,message=FALSE}
+dtimings=collate_driver_info(list(PD),treemodel = treemodel,b.is.null = FALSE)
+tmp1=suppressWarnings(
+  do_acquisition_plot2b(inf=dtimings,PD$pdx$meta$COLONY_TIMEPOINTS,PD$pdx$meta$RECAP_TIMEPOINTS,
+                       extra=": Mutant Clade Specific Rates",
+                       b.add.text = TRUE,
+                       xmax=ceiling(max(dtimings$max_age_at_sample)/10)*10))
+
+kable(dtimings[,fields], "html") %>% kable_styling("striped") %>% scroll_box(width="95%")
+```
+
+## Methods for timing LOH and amplification
+
+The timing methods require an rough approximation for the number of expected detectable mutations, $L$, in the LOH/CNA region for the duration of the branch.
+
+### Background local mutation rate
+
+Firstly we estimate a local relative somatic mutation rate for mutations detectable by CaveMan in autosomal regions. The rate is measured across a panel of samples consisting of all those colonies in all 12 patients that do not exhibit copy number aberrations.  The genome is divided into 100Kb bins and the number of passed somatic mutations is counted across all samples in the panel, to give a count $c_i$ for bin $b_i$.  The probability that a given mutation occurs in bin $i$ is estimated by $p(mut \in b_i)=\frac{c_i}{\sum_j c_j}$ and standard error $p_{se}=\frac{p(mut \in b_i)}{\sqrt{c_j}}$.  For a given copy number region $C$ then 
+$p(mut \in C)=\sum_{b_i \in C} p(mut \in b_i)$.  For a branch of duration $t$ and with global mutation rate $\lambda$ then $E(L)=\lambda t p(mut \in C)$ and $Var(L)=\lambda^2 t^2 \sum_{b_i \in C} p_{se}(mut \in b_i)^2$ where here we are not modelling errors in $t$ and $\lambda$.  
+
+
+
+### Copy number neutral LOH timing
+
+All somatic mutations that occur prior to the LOH event, occurring a fraction $x$ along the branch, will be homozygous with detection sensitivity $s_{\text{HOM}}$ and those after will be heterozygous with detection sensitivity $s_{\text{HET}}$. We model the mutations as arriving at a constant rate along the branch and fit the following model for $x$ :
+
+\[ N_{\text{HET}} \sim \text{Poisson} \left( (1-x) L s_{\text{HET}} \right) \]
+\[ N_{\text{HOM}} \sim \text{Poisson} \left( x L s_{\text{HOM}} \right) \]
+
+with priors $x \sim \text{Uniform}(0,1)$ and $L \sim \mathcal{N}(E(L),Var(L))$ and where $s_{\text{HOM}}=0.5$ (assuming perfect detection of homozygous mutant variants) and $s_{\text{HET}}$ is estimated from germline SNPs as previously discussed.
+
+
+### Timing duplications
+
+Somatic mutations that occur prior to the CNA event, occurring a fraction $x$ along the branch, have an equal chance of exhibiting VAF=1/3 or VAF=2/3, whereas those occurring after the event will always have VAF=1/3.
+
+\[ N_{2/3} \sim \text{Poisson} \left( \frac{x L s_{1/3} }{2} \right) \]
+\[ N_{1/3} \sim \text{Poisson} \left( s_{2/3} \left( \frac{x L }{2} + (1-x) L \right) \right) \]
+
+Where the priors are as in the LOH model above. The detection sensitivities $s_{1/3}$ and $s_{2/3}$ are approximated by $s_{het}$ because of the additional sequencing depth afforded by the duplication, all though it is acknowleged that this approach is likely to underestimate the $s_{2/3}$.  Unlike the LOH case, the value of $x$ will be relatively unaffected by $L$ because of the similarity of  $s_{1/3}$ and $s_{2/3}$.
+
+#### Classifying variants 
+
+The Bernoulli trial probability of the observing the mutant allele on a given read given that true VAF is $\mu$ and assuming an error rate $\epsilon$ is as follows:
+
+\[  p(mut)=p(mut|\text{mutant read})p(\text{mutant read})+p(mut|\text{wild type read})p(\text{wild type read}) \]
+\[  p(mut)=(1-\epsilon)\mu+\frac{\epsilon}{3}(1-\mu) \]
+
+Where in the above "mutant read" etc denotes that the read originated from a mutant chromosome.
+
+Where a variant can be classified as having one of 2 VAFs ($\mu_1$ or $\mu_2$, with each having same prior probability:
+
+\[ p(VAF=\mu_1|data)=\frac{p_{\text{binom}}(k=m|n=depth,p=(1-\epsilon)\mu_1+\frac{\epsilon}{3}(1-\mu_1))}{p_{\text{binom}}((k=m|n=depth,p=(1-\epsilon)\mu_1+\frac{\epsilon}{3}(1-\mu_1))+p_{\text{binom}}(k=m|n=depth,p=(1-\epsilon)\mu_2+\frac{\epsilon}{3}(1-\mu_2))} \]
+
+If desired this can be further simplified; setting $\mu^{*}_{1}=(1-\epsilon)\mu_1+\frac{\epsilon}{3}(1-\mu_1))$ and $\mu^{*}_{2}=(1-\epsilon)\mu_2+\frac{\epsilon}{3}(1-\mu_2))$ then
+
+\[ p(VAF=\mu_1|data)=\frac{\mu^{*m}_{1} (1-\mu^{*}_{1})^{d-m}}{\mu^{*m}_{1} (1-\mu^{*}_{1})^{d-m}+\mu^{*m}_{2} (1-\mu^{*}_{2})^{d-m}} \]
+
+We use the above to classify both duplicated (VAF=2/3) vs unduplicated (VAF=1/3)  and also heterozygous(VAF=0.5) vs homozygous mutant (VAF=1).  Only variants where one of these probabilities exceeds 0.95 is classified, the others remain unclassified and are not included in the model.
+
+Note that when applied to shared branches we typically have high accuracy in classifying variants because we consider reads that are aggregated across all colonies that share the branch.
+
+
+##  Background Model 
+```{r , dev.args=list(pointsize=8),fig.height=8,fig.width=10,message=FALSE,error=FALSE,results=FALSE}
+library(karyoploteR)
+gr=GRanges(sprintf("chr%s",bins$chr), IRanges(start=bins$start,end=bins$end))
+mcols(gr)=data.frame(y=bins$prob)
+ymax=max(bins$prob)
+ymin=0
+kp <- plotKaryotype(chromosomes=sprintf("chr%s",1:22),plot.type=1)
+kpAbline(kp, h=0, ymin=ymin, ymax=ymax, lty=2, col="#666666")
+kpAxis(kp, ymin = ymin, ymax=ymax)
+kpLines(kp, data=gr, ymin=ymin, ymax=ymax)
+```
+
+
+## Summary of LOH timing inference
+We apply the above model to any copy number neutral LOH events in the tree:
+
+```{r ,message = FALSE,error=FALSE,results=TRUE,message=FALSE}
+hethomres=get_hethom(PD,refcolony,b_do_plot=TRUE)
+cnatimings=hethomres$hethom
+cnatimings2=cnatimings %>% left_join(globaltimings,by="node")
+cnatimings2$mean_loh_event=cnatimings2$xmean*(cnatimings2$upper_mean-cnatimings2$lower_mean)+cnatimings2$lower_mean
+cnatimings2$lower_loh_event=cnatimings2[["x2.5."]]*(cnatimings2$upper_mean-cnatimings2$lower_mean)+cnatimings2$lower_mean
+cnatimings2$upper_loh_event=cnatimings2[["x97.5."]]*(cnatimings2$upper_mean-cnatimings2$lower_mean)+cnatimings2$lower_mean
+cnatimings2$t_before_end=(1-cnatimings2$xmean)*(cnatimings2$upper_mean-cnatimings2$lower_mean)
+cnatimings2$t_before_end_lower=(1-cnatimings2[["x97.5."]])*(cnatimings2$upper_mean-cnatimings2$lower_mean)
+cnatimings2$t_before_end_upper=(1-cnatimings2[["x2.5."]])*(cnatimings2$upper_mean-cnatimings2$lower_mean)
+kable(cnatimings2, "html") %>% kable_styling("striped") %>% scroll_box(width="95%")
+```
+
+## VAF Distribution of Targeted Follow Up Samples
+
+```{r  echo = t,message=FALSE,echo=FALSE}
+pdx=PD$pdx
+pdx$tree_ml=PD$fit[[treemodel]]$nullmodel$ultratree
+out = NULL
+pwidth=14
+for(i in 1:dim(pdx$meta$baitinfo)[1]){
+  sample=pdx$meta$baitinfo[i,"sample"]
+  mdepth=mean(pdx$dat$dep[pdx$dat$dep[,sample]>5,sample],na.rm=TRUE)
+  pdx$dat$details$isdeep=pdx$dat$dep[,sample]>min(50,mdepth/2) & pdx$dat$details$Chrom %in% 1:22 & pdx$dat$details$p_cna>1e-3 & !pdx$dat$details$is_localx_excluded & pdx$dat$details$TYPE=="SNV"
+  label=sprintf("%s: Cell Type=%s: Age=%3.1f : Mean Depth=%4.1f",sample,
+                pdx$meta$baitinfo[i,"Cell.type"],
+                pdx$meta$baitinfo[i,"Age.of.sample"],mdepth
+                )
+  ###plot_vaf_tree(pdx,label,samples = sample,filter.on = "isdeep",cex.label = 0,mode="recap")
+  out = c(out, knitr::knit_child('PlotVafTreeBig.Rmd',quiet=TRUE))
+}
+```
+`r paste(out, collapse = '\n')`
+
+Here we exclude all local CNAs and depict as color VAF plots
+
+```{r  echo = t, dev.args=list(pointsize=14),fig.height=8,fig.width=14,message=FALSE,echo=FALSE,results=FALSE}
+pdx$tree_ml=PD$fit[[treemodel]]$nullmodel$ultratree
+for(i in 1:dim(pdx$meta$baitinfo)[1]){
+  sample=pdx$meta$baitinfo[i,"sample"]
+  mdepth=mean(pdx$dat$dep[pdx$dat$dep[,sample]>5,sample],na.rm=TRUE)
+  pdx$dat$details$isdeep=pdx$dat$dep[,sample]>min(50,mdepth/2) & pdx$dat$details$Chrom %in% 1:22 & pdx$dat$details$p_cna>1e-3 & !pdx$dat$details$is_localx_excluded & pdx$dat$details$TYPE=="SNV"
+  label=sprintf("%s: Cell Type=%s: Age=%3.1f : Mean Depth=%4.1f",sample,
+                pdx$meta$baitinfo[i,"Cell.type"],
+                pdx$meta$baitinfo[i,"Age.of.sample"],mdepth
+                )
+  plot_color_vaf_tree(pdx,label,samples = sample,filter.on = "isdeep",cex.label = 0,mode="recap",legpos.vaf="left",legpos=NULL,cv=CV,genes=GENES)
+}
+```
+
+
+## QC Related plots
+
+###  Chromosome proportions
+
+Check to see if any branches exhibit anomalous chromosome representation. Here we can choose to use the newly generated time-based trees and relaxed p-value threshold for illustrative purposes:
+```{r echo = t, dev.args=list(pointsize=8),fig.height=5,fig.width=10,message=FALSE,results=FALSE}
+tree=plot_tree(PD$fit[[treemodel]]$altmodel$ultratree)
+tree=plot_chromosome_annotated_tree(tree,PD$pdx$dat,pthreshold = 0.05)
+```
+
+### Pooled VAF tree
+
+The following highlights branches where the mutant read count aggregated across all colonies that share the branch is significantly lower than a specified minimum VAF - here 0.35. Only autosomal non CNA/LOH regions are considered:
+
+```{r,dev.args=list(pointsize=8),fig.height=5,fig.width=10,message=FALSE,results=FALSE}
+tree=plot_vaf_tree(PD$pdx %>% (function(x) {x$dat$details$ISOK=(x$dat$details$is_localx_excluded==0) ; x}),label = "Pooled VAF Tree (Threshold=0.35)",samples =NULL,b.add.drivers = FALSE,filter.on = "ISOK",min.mean.vaf = 0.35)
+```
+
+Here the threshold is set to a more stringent 0.45 and we get a single branch with a red outline indicating that the VAF is significantly less that the threshold on a Bonferonni adjusted basis.
+
+```{r,dev.args=list(pointsize=8),fig.height=5,fig.width=10,message=FALSE,results=FALSE}
+tree=plot_vaf_tree(PD$pdx %>% (function(x) {x$dat$details$ISOK=(x$dat$details$is_localx_excluded==0) ; x}),label = "Pooled VAF Tree (Threshold=0.45)",samples =NULL,b.add.drivers = FALSE,filter.on = "ISOK",min.mean.vaf = 0.45)
+```
+
+### Colony VAF QC plot
+
+For the colony "w" we check for per branch aggregate VAFs that are significantly less that 0.35
+
+```{r, dev.args=list(pointsize=8),fig.height=5,fig.width=10,message=FALSE,results=FALSE}
+plot_vaf_tree(PD$pdx %>% (function(x) {x$dat$details$ISOK=(x$dat$details$is_localx_excluded==0) ; x}),label = "VAF of colony w on all branches (Threshold=0.35)",samples = "w",b.add.drivers = FALSE,filter.on = "ISOK",min.mean.vaf = 0.35)
+```
+
+If we set a threshold of 0.5 then one edge is highlighted in blue as nominally significantly non-clonal:
+
+```{r, dev.args=list(pointsize=8),fig.height=5,fig.width=10,message=FALSE,results=FALSE}
+plot_vaf_tree(PD$pdx %>% (function(x) {x$dat$details$ISOK=(x$dat$details$is_localx_excluded==0) ; x}),label = "VAF of colony w on all branches (Threshold=0.35)",samples = "w",b.add.drivers = FALSE,filter.on = "ISOK",min.mean.vaf = 0.5)
+```
+
+```{r}
+cat("Working directory=",getwd(),"\n")
+sessionInfo()
+```

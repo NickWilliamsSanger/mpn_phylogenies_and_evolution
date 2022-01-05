@@ -1,0 +1,210 @@
+---
+title: "ExampleABC"
+author: "Nick Williams"
+date: "22/01/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("kableExtra")
+```
+---
+  date: `r format(Sys.Date(), "%d/%m/%Y")`
+---
+## Example ABC
+For each patient we have prepared data in the following form:
+
+```{r message=FALSE,results='hide'}
+library("rsimpop")
+treedat=readRDS("../data/example_treedat.RDS")
+```
+
+The original inferred tree:
+```{r}
+tree=plot_tree(treedat$tree,cex.label=0.7)
+node_labels(tree,cex=0.7)
+```
+
+The clade of interest:
+
+```{r}
+cat("Clade at node ",treedat$drivernode,": Starts Mutation",treedat$edgemutstart,": Ends at Mutation",treedat$edgemutend,"  \nRemember the above is an adjusted burden so not integer valued\n")
+plot_tree(treedat$refclade)
+```
+
+Code for sampling an age since conception given an accrued mutation burden:
+```{r}
+##First n terms of exponential as expressed as a proportion of the full exponential
+expn=function(n,x){exp(-x)+sum(sapply(1:n,function(i) exp(-x+i*log(x)-lfactorial(i))))}
+#p(t|m)~p(m|t)p(t) if we assume flat interval prior 0..To 
+# then the cumulative density function is:
+CDF=function(x,m=5,lambda=20,To=50) (sapply(x,function(x) (1-expn(m,lambda*x))/(1-expn(m,lambda*To))))
+# So that we can straightforwardly include the development burst we can instead do the analysis in LAMBDA space
+# and convert back to time at the end  (our flat prior is therefore now on 0-lambda*To)
+CDF2=function(x,m=5,LAMBDA=50*20) (sapply(x,function(x) (1-expn(m,x))/(1-expn(m,LAMBDA))))
+##In our standard development model we have excess mutations governed by the following
+logisticMean=function(L,k,midpoint,a,b){((L/k)*(log(1+exp(k*(b-midpoint)))-log(1+exp(k*(a-midpoint))))) / (b-a);}
+totalLambda=function(lambda,t,t0=0){ (t-t0)*lambda+(t-t0)*logisticMean(149.2,-50.0,0.22,t0,t)}
+
+simfromcdf=function(cdf,start,end,size){
+  ##Simulates down to a granularity of 1/1e4 of the range.
+  x=seq(start,end,length.out = 10000)
+  cval=cdf(x)
+  idx=which(cval>1e-8)
+  if(idx[1]>1){
+    cval=cval[-(1:(idx[1]-1))]
+    x=x[-(1:(idx[1]-1))]
+  }
+  rval=runif(size)
+  idx=findInterval(rval,cval,rightmost.closed = TRUE,all.inside = TRUE)
+  0.5*(x[idx]+x[idx+1])
+}
+
+sample_acq_time=function(m,lambda,To,N,t0=0){
+  m=round(m)
+  clambda=simfromcdf(function(x) CDF2(x,m=m,LAMBDA = lambda*(To-t0)),start = 0,end=lambda*(To-t0),size = N)
+  sapply(clambda,function(clambda) { 
+    #cat(clambda)
+    uniroot(function(x) totalLambda(lambda,x,t0 = t0)-clambda,lower = max(1e-6,t0+1e-6),upper=To)$root}
+    )
+}
+```
+
+These other function(s) are also used in generating simulations and summary statistics:
+```{r}
+require("dplyr")
+require("MASS")
+run_dltt_abc=function(tree,edgemutstart,edgemutend,age,nsim,maxtry=40,maxN=1e6,smin=0.03,smax=2,divrate=1/365){
+  m=length(tree$tip.label)
+  ##Here we extend the cumulative per mutation LTT to a large number of mutations
+  lttref=ltt2(tree,maxn=2000)
+  N=ceiling(10**runif(n=nsim,min = 3.5,max=log10(maxN)))
+  ##Take the mean node heights to estimate average total burden in clade
+  nh=nodeHeights(tree)
+  mb=mean(nh[which(tree$edge[,2]<=length(tree$tip.label)),2])+edgemutend
+  ##Convert this average burden to a rate.
+  rate=mb/age
+  ##Resample mutation counts at start and end of driver edge using Poisson distribution
+  #dstart=rpois(n=nsim,edgemutstart)/rate
+  #dend=dstart+rpois(n=nsim,edgemutend-edgemutstart)/rate
+  ## Small mutcount correction to above approach.
+  dstart=sample_acq_time(m=edgemutstart,lambda=rate,To=age,N=nsim,t0=0)
+  dend=sapply(dstart,function(t0) sample_acq_time(m=edgemutend-edgemutstart,lambda=rate,To=age,N=1,t0=t0))
+  
+  ##Now take driver initiation uniformly from within that range..
+  dt=runif(n=nsim,min=dstart,max=dend)
+  if(any(is.na(dt))){
+    stop("Unexpected problem with dt")
+  }
+  #Big S is the annualised fitness coefficient (S=exp(alpha*s)-1) where alpha is division rate per year (=365*divrate)
+  S=runif(n=nsim,min=smin,max=smax)
+  #Little s is the per division fitness coefficient.
+  s=log(1+S)/(365*divrate)
+  #Initialise parameter data frame
+  params=data.frame(N=N,n=NA,S=S,s=s,dt=dt,epsilon=NA,epsilon_ltt2=NA,smin=smin,smax=smax,divrate=divrate,mutfirstsplit=NA)
+  params$seed=NA
+  #maxtry=20
+  simtree=list()
+  params$tries=maxtry+1
+  for(i in 1:nsim){
+    #Note that inconveniently the seed is set just once at the beginning of the simulations - so the sims need to be run
+    #in order to be reproduced.
+    params$seed[i]=simpop_seed
+    selsim=run_selection_sim(
+      0.1,
+      divrate,
+      target_pop_size = params$N[i],
+      nyears_driver_acquisition = params$dt[i],
+      nyears = age,
+      fitness=params$s[i],
+      minprop=0.0001,
+      mindriver=m,
+      maxtry=maxtry
+    )
+    if(!is.null(selsim)){
+      params$tries[i]=selsim$tries
+      #Sample
+      dnode=selsim$events$node[which(selsim$events$driverid==1)]
+      if(length(dnode)!=1){
+        stop("wrong number of drivers!")
+      }
+      drivercells=selsim$edge[which(selsim$driverid==1),2]
+      drivercells=drivercells[which(drivercells<=length(selsim$tip.label))]
+      outgroup=selsim$events$node[which(selsim$events$value==0)]
+      if(length(drivercells)>m){
+        ##This gets the sub sampled tree from the mutant cell population that is the same size as the input mutant clade.
+        t1=get_subsampled_tree(selsim,m+1,c(outgroup,sample(drivercells,size=m,replace=FALSE)))
+        ##Assign mutations to the tree using a negative binomial model with variance=twice the mean
+        #t1=suppressWarnings(get_elapsed_time_tree(t1,mutrateperdivision = 0,backgroundrate = rate/365,odf = 2))
+        ## The following assigns mutations following the embryonic dvelopment model.
+        t1=suppressWarnings(get_elapsed_time_tree_with_dev(t1,backgroundrate = rate,odf = 2))
+        
+        outgroup=t1$events$node[which(t1$events$value==0)]
+        ##Get the mutant founder edge for this suimulated tree.
+        thisdnode=t1$events$node[which(t1$events$driverid==1)]
+        ##Calculate number of mutations at first split
+        params$mutfirstsplit[i]=nodeHeights(t1)[which(t1$edge[,2]==thisdnode),2]
+        ##Now calculate LTT for this simulated tree
+        tt=multi2di(drop.tip(t1,t1$tip.label[outgroup]))
+        simltt=ltt2(tt,maxn=2000)
+        ##Calculate epsilon as the absolute sum of the differences in the LTT.  Note that since both
+        ##simulated and input clade have the same number of colonies the the contribution from the large mutation count goes to zero.
+        params$epsilon[i]=sum(abs(simltt-lttref))
+        ##Additional metric (not currently used) incorporates difference in mutation at first split into the epsilon metric.
+        params$epsilon_ltt2[i]=sum(abs(c(params$mutfirstsplit[i],simltt)-c(edgemutend,lttref)))
+        params$n[i]=length(drivercells)
+        simtree[[i]]=tt
+        simtree[[i]]$pparam=params[i,]
+      }
+    }
+  }
+  list(params=params,simtree=simtree)
+}
+
+
+ltt=function(tree,bins=seq(100,800,100)){
+  nh=nodeHeights(tree)
+  ##Lineages per mutation
+  lpm=sapply(1:max(bins),function(i) length(which(nh[,1]<=i & nh[,2]>i)))
+  sapply(1:(length(bins)-1),function(i) mean(lpm[bins[i]:(bins[i+1]-1)]))
+}
+
+ltt2=function(tree,maxn=2000){
+  bins=1:maxn
+  nh=nodeHeights(tree)
+  ##Lineages per mutation
+  lpm=sapply(1:maxn,function(i) length(which(nh[,1]<=i )))
+  sapply(1:(length(bins)-1),function(i) mean(lpm[bins[i]:(bins[i+1]-1)]))
+}
+get_elapsed_time_tree_with_dev=function (tree, backgroundrate = NULL, 
+         odf = 1) 
+{
+  N = length(tree$tip.label) + 1
+  L = length(tree$edge.length)
+  TT = max(tree$timestamp)
+  idx.child = match(tree$edge[, 2], tree$edge[, 1])
+  duration = ifelse(is.na(idx.child), TT - tree$tBirth, tree$tBirth[idx.child] - 
+                      tree$tBirth)
+  duration[which(tree$state == 0)] = 0
+  t0=tree$tBirth/365
+  t1=t0+duration/365+1e-6
+  #browser()
+  if (odf > 1) {
+      tree$edge.length = rsimpop:::get_nb(n = L, meanmuts = totalLambda(backgroundrate,t1,t0), od = odf)
+  }else {
+      tree$edge.length = rpois(n=L, totalLambda(backgroundrate,t1,t0))
+  }
+  tree
+}
+```
+
+Example run is as follows - here we set the max population size to be modest for illustration purposes:
+```{r, message=FALSE,results='hide'}
+abcsims=run_dltt_abc(treedat$refclade,treedat$edgemutstart,treedat$edgemutend,treedat$age,nsim=10,maxN=2e5)
+```
+
+The summary statistics are as follows:
+```{r}
+kable(abcsims$params, "html") %>% kable_styling("striped")
+```

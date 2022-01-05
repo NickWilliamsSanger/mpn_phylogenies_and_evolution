@@ -1,0 +1,17 @@
+<style>
+  .superbigimage{
+      overflow-x:scroll;
+      white-space: nowrap;
+  }
+
+  .superbigimage img{
+     max-width: none;
+  }
+
+
+</style>
+<div class="superbigimage">
+```{r fig.width=pwidth,fig.height=6,echo=FALSE,message=FALSE,results='asis'}
+tree=plot_vaf_tree(pdx,label,samples = sample,filter.on = "isdeep",cex.label = 0,mode="recap")
+```
+</div>
